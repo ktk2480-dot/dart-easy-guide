@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 빌드 결과물
+release/
+build/
+dist/
+
+# 인증키와 로컬 데이터
+api_key.bin
+*.sqlite
+*.log
+.env
