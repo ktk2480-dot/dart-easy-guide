@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import APP_NAME, __version__
-from .agent import AgentError, ClaudeAgent, ClaudeStatus, DartTools, check_login, open_login
+from .agent import API_KEY_URL, AgentError, ClaudeAgent, ClaudeStatus, DartTools, check_auth, open_login, test_api_key
 from .analysis import analyze_company, build_report, contract_tables, display_table
 from .derivative_contracts import Contract
 from .derivative_scan import KST, PRESETS, SCOPES, ScanRunner, ScanStore
@@ -36,7 +36,7 @@ from .examples import (
 )
 from .formatting import months_ago
 from .guide import KEY_STEPS, build_guide_report, glossary_html
-from .keystore import KeyStore, KeyStoreError, is_valid_key, mask_key
+from .keystore import ClaudeKeyStore, KeyStore, KeyStoreError, is_valid_claude_key, is_valid_key, mask_key
 from .report import Report, Section, Table, apply_to_document, export_pdf
 
 POPULAR = [("삼성전자", "005930"), ("SK하이닉스", "000660"), ("현대차", "005380"), ("NAVER", "035420"), ("카카오", "035720")]
@@ -186,6 +186,62 @@ class KeyDialog(QDialog):
         ok = is_valid_key(value)
         self.buttons.button(QDialogButtonBox.Ok).setEnabled(ok)
         self.hint.setText("" if not value or ok else f"현재 {len(value)}자입니다. 영문과 숫자 40자리를 입력해 주세요.")
+
+    @property
+    def value(self) -> str:
+        return self.edit.text().strip()
+
+
+class ClaudeKeyDialog(QDialog):
+    """Claude API 키 입력 창. 키는 암호화해 저장하고, Claude Code 로그인이 없을 때만 쓴다."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Claude API 키 입력")
+        self.setMinimumWidth(540)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.addWidget(label("Claude API 키를 입력해 주세요", "h2"))
+        layout.addWidget(label("Claude Console에서 발급한 API 키(sk-ant-api…)를 붙여 넣습니다. "
+                               "Claude Code에 로그인되어 있으면 로그인을 먼저 쓰고, 로그인이 없을 때만 이 키를 씁니다.", "muted", True))
+        row = QHBoxLayout()
+        self.edit = QLineEdit()
+        self.edit.setEchoMode(QLineEdit.Password)
+        self.edit.setPlaceholderText("sk-ant-api03-… 붙여넣기")
+        self.edit.setMaxLength(320)
+        self.edit.textChanged.connect(self._validate)
+        reveal = QPushButton("보기")
+        reveal.setCheckable(True)
+        reveal.toggled.connect(lambda on: (self.edit.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password), reveal.setText("숨기기" if on else "보기")))
+        row.addWidget(self.edit, 1)
+        row.addWidget(reveal)
+        layout.addLayout(row)
+        self.hint = label("", "muted", True)
+        layout.addWidget(self.hint)
+        layout.addWidget(label("키는 Windows DPAPI로 암호화해 이 PC의 내 계정에만 저장하고, Claude Code나 다른 프로그램에 넘기지 않습니다. "
+                               "API로 쓴 만큼 키를 발급한 조직에 요금이 청구됩니다.", "muted", True))
+        link = QPushButton("API 키 발급 페이지 열기")
+        link.clicked.connect(lambda: safe_open(API_KEY_URL))
+        layout.addWidget(link, 0, Qt.AlignLeft)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.button(QDialogButtonBox.Ok).setText("저장")
+        self.buttons.button(QDialogButtonBox.Ok).setObjectName("primary")
+        self.buttons.button(QDialogButtonBox.Cancel).setText("취소")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self._validate("")
+
+    def _validate(self, text: str):
+        value = text.strip()
+        ok = is_valid_claude_key(value)
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(ok)
+        if not value or ok:
+            self.hint.setText("")
+        elif value.startswith("sk-ant-oat"):
+            self.hint.setText("Claude 구독 로그인 토큰은 넣을 수 없습니다. 구독은 [Claude 로그인]으로 쓰고, 여기에는 Console의 API 키를 넣어 주세요.")
+        else:
+            self.hint.setText("sk-ant-api로 시작하는 Claude API 키 형식이 아닙니다.")
 
     @property
     def value(self) -> str:
@@ -1051,7 +1107,7 @@ def fix_bold(text: str) -> str:
 
 
 class AgentPage(QWidget):
-    """Claude Code 로그인으로 동작하는 대화 화면."""
+    """Claude Code 로그인으로 동작하고, 로그인이 없을 때만 저장한 Claude API 키를 쓰는 대화 화면."""
     agent_event = Signal(str, str)
     SUGGESTIONS = ("삼성전자 환위험과 파생거래 요약해 줘", "현대차와 기아 수출 비중 비교해 줘", "농심 최근 3년 재무 흐름 알려 줘")
 
@@ -1073,7 +1129,7 @@ class AgentPage(QWidget):
         titles = QVBoxLayout()
         titles.setSpacing(0)
         titles.addWidget(label("AI 에이전트", "h1"))
-        self.state = label("Claude Code 로그인을 확인하는 중입니다.", "muted")
+        self.state = label("Claude 연결 상태를 확인하는 중입니다.", "muted", True)
         titles.addWidget(self.state)
         top.addLayout(titles, 1)
         self.login_button = QPushButton("Claude 로그인")
@@ -1081,6 +1137,11 @@ class AgentPage(QWidget):
         self.login_button.clicked.connect(self._login)
         self.login_button.hide()
         top.addWidget(self.login_button)
+        self.key_button = QPushButton("API 키 등록")
+        self.key_button.setToolTip("Claude Code 로그인이 없을 때 쓸 Claude API 키를 등록합니다.")
+        self.key_button.clicked.connect(lambda: self.main.ask_claude_key())
+        self.key_button.hide()
+        top.addWidget(self.key_button)
         self.new_button = QPushButton("새 대화")
         self.new_button.clicked.connect(self.reset)
         top.addWidget(self.new_button)
@@ -1111,7 +1172,8 @@ class AgentPage(QWidget):
         self.send_button.clicked.connect(self._send_clicked)
         row.addWidget(self.send_button)
         outer.addLayout(row)
-        outer.addWidget(label("질문과 조회한 공시는 내 Claude 계정으로 전송됩니다. 고객정보나 회사 내부 자료는 입력하지 마세요. AI 답변은 원문으로 확인해 주세요.", "muted", True))
+        outer.addWidget(label("질문과 조회한 공시는 Claude로 전송됩니다(로그인한 Claude 계정, 또는 API 키를 발급한 조직). "
+                              "고객정보나 회사 내부 자료는 입력하지 마세요. AI 답변은 원문으로 확인해 주세요.", "muted", True))
         self._render()
 
     def eventFilter(self, watched, event):
@@ -1123,11 +1185,22 @@ class AgentPage(QWidget):
 
     def refresh_login(self):
         def done(status: ClaudeStatus):
-            suffix = f" 로그인 만료 예정: {status.expires}" if status.ready and status.expires else ""
+            suffix = f" 로그인 만료 예정: {status.expires}" if status.mode == "oauth" and status.expires else ""
             self.state.setText(("● " if status.ready else "○ ") + status.message + suffix)
-            self.login_button.setVisible(not status.ready)
+            self.login_button.setVisible(not status.oauth_ready)
+            self.key_button.setVisible(not status.oauth_ready)
+            self.key_button.setText("API 키 변경" if status.mode == "api" else "API 키 등록")
 
-        self.main.run_task(check_login, done, lambda _e: self.state.setText("○ Claude Code 상태를 확인하지 못했습니다."), "Claude 로그인 확인 중", handle_key_error=False)
+        self.main.run_task(lambda: check_auth(self.main.claude_keys), done,
+                           lambda _e: self.state.setText("○ Claude 연결 상태를 확인하지 못했습니다."), "Claude 연결 확인 중", handle_key_error=False)
+
+    def credentials_changed(self):
+        """API 키를 바꾸거나 지우면 그 키로 열린 연결을 닫아, 다음 질문부터 새 설정을 쓰게 한다."""
+        agent = self.agent
+        if agent and agent.mode == "api":
+            agent.stop()
+            self.shutdown()
+        self.refresh_login()
 
     def _login(self):
         try:
@@ -1164,7 +1237,7 @@ class AgentPage(QWidget):
             return
         if self.agent is None:
             tools = DartTools(lambda: self.main.make_client(self.main.session_key or key), self.main.index)
-            self.agent = ClaudeAgent(tools, self.agent_event.emit)
+            self.agent = ClaudeAgent(tools, self.agent_event.emit, self.main.claude_keys)
         self.messages += [["user", text], ["assistant", ""]]
         self._set_busy(True, "생각하는 중")
         self._render()
@@ -1190,6 +1263,8 @@ class AgentPage(QWidget):
         elif kind == "tool":
             self.activity = text
             self._render_timer.start()
+        elif kind == "mode":
+            self.state.setText("● " + text)
         elif kind == "done":
             if not self.messages[-1][1]:
                 self.messages[-1][1] = "_답변을 멈췄습니다._"
@@ -1580,7 +1655,15 @@ class SettingsPage(QWidget):
         super().__init__()
         self.setObjectName("page")
         self.main = main
-        outer = QVBoxLayout(self)
+        # 패널이 늘어나 창이 낮을 때 내용이 겹치지 않도록 스크롤 안에 둔다.
+        page = QVBoxLayout(self)
+        page.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget(objectName="page")
+        scroll.setWidget(inner)
+        page.addWidget(scroll)
+        outer = QVBoxLayout(inner)
         outer.setContentsMargins(30, 26, 30, 18)
         outer.setSpacing(12)
         outer.addWidget(label("인증키와 설정", "h1"))
@@ -1607,6 +1690,31 @@ class SettingsPage(QWidget):
         box.addLayout(row)
         box.addWidget(label("키는 Windows DPAPI로 암호화해 이 PC의 내 계정 폴더에 저장합니다. 다른 계정이나 다른 PC로 파일을 복사해도 풀 수 없습니다. PDF와 화면의 호출 내역에는 키가 표시되지 않습니다.", "muted", True))
         outer.addWidget(panel)
+
+        claude_panel = QFrame(objectName="panel")
+        claude_box = QVBoxLayout(claude_panel)
+        claude_box.setContentsMargins(18, 16, 18, 16)
+        claude_box.setSpacing(9)
+        claude_box.addWidget(label("Claude API 키 (선택)", "h2"))
+        self.claude_state = label("", "", True)
+        claude_box.addWidget(self.claude_state)
+        claude_row = QHBoxLayout()
+        claude_change = QPushButton("키 입력 / 변경")
+        claude_change.clicked.connect(lambda: main.ask_claude_key())
+        self.claude_test = QPushButton("연결 테스트")
+        self.claude_test.setToolTip("키와 모델 사용 권한만 확인합니다. 요금이 들지 않습니다.")
+        self.claude_test.clicked.connect(self._test_claude)
+        self.claude_remove = QPushButton("저장된 키 삭제")
+        self.claude_remove.clicked.connect(self._delete_claude)
+        claude_issue = QPushButton("API 키 발급 페이지")
+        claude_issue.clicked.connect(lambda: safe_open(API_KEY_URL))
+        for button in (claude_change, self.claude_test, self.claude_remove, claude_issue):
+            claude_row.addWidget(button)
+        claude_row.addStretch(1)
+        claude_box.addLayout(claude_row)
+        claude_box.addWidget(label("AI 기능은 Claude Code 로그인을 먼저 씁니다. 로그인이 없을 때만 이 키로 Claude API를 직접 호출하며, "
+                                   "쓴 만큼 키를 발급한 조직에 요금이 청구됩니다. 키는 DPAPI로 암호화해 저장하고 Claude Code에는 넘기지 않습니다.", "muted", True))
+        outer.addWidget(claude_panel)
 
         panel2 = QFrame(objectName="panel")
         box2 = QVBoxLayout(panel2)
@@ -1640,6 +1748,15 @@ class SettingsPage(QWidget):
             self.state.setText("등록된 인증키가 없습니다.")
         self.test.setEnabled(has_key)
         self.remove.setEnabled(stored or has_key)
+        claude_key = None
+        try:
+            claude_key = self.main.claude_keys.load()
+            self.claude_state.setText(f"<b>{mask_key(claude_key)}</b> &nbsp; (암호화 저장됨 · Claude Code 로그인이 없을 때만 사용)" if claude_key
+                                      else "등록된 Claude API 키가 없습니다. 키가 없어도 Claude Code 로그인으로 AI 기능을 쓸 수 있습니다.")
+        except KeyStoreError as exc:
+            self.claude_state.setText(str(exc))
+        self.claude_test.setEnabled(bool(claude_key))
+        self.claude_remove.setEnabled(self.main.claude_keys.exists())
         total = self.main.index.count()
         self.index_state.setText(f"{total:,}개 회사를 검색할 수 있습니다." if total else "첫 검색 때 회사 목록을 자동으로 내려받습니다.")
 
@@ -1664,6 +1781,38 @@ class SettingsPage(QWidget):
         if answer == QMessageBox.Yes:
             self.main.forget_key()
 
+    def _test_claude(self):
+        try:
+            key = self.main.claude_keys.load()
+        except KeyStoreError as exc:
+            QMessageBox.warning(self, "Claude API 연결 테스트", str(exc))
+            return
+        if not key:
+            return
+        self.claude_test.setEnabled(False)
+
+        def job():
+            try:
+                return test_api_key(key)
+            except AgentError as exc:
+                raise DartError("APP", str(exc)) from None
+
+        def done(message: str):
+            self.refresh_state()
+            QMessageBox.information(self, "Claude API 연결 테스트", message)
+
+        def fail(error: DartError):
+            self.refresh_state()
+            QMessageBox.warning(self, "Claude API 연결 테스트", error.message)
+
+        self.main.run_task(job, done, fail, "Claude API 연결 확인 중", handle_key_error=False)
+
+    def _delete_claude(self):
+        answer = QMessageBox.question(self, "Claude API 키 삭제",
+                                      "저장된 Claude API 키를 삭제할까요?\nClaude Code 로그인이 없으면 AI 기능을 쓸 수 없게 됩니다.")
+        if answer == QMessageBox.Yes:
+            self.main.forget_claude_key()
+
     def _refresh(self):
         key = self.main.require_key()
         if key:
@@ -1674,10 +1823,11 @@ class MainWindow(QMainWindow):
     task_finished = Signal(int, object, object)
 
     def __init__(self, client_factory: Callable[[str], DartClient] = DartClient, keys: KeyStore | None = None, index: CorpIndex | None = None,
-                 scan_store: ScanStore | None = None):
+                 scan_store: ScanStore | None = None, claude_keys: ClaudeKeyStore | None = None):
         super().__init__()
         self.make_client = client_factory
         self.keys = keys or KeyStore()
+        self.claude_keys = claude_keys or ClaudeKeyStore(self.keys.path.with_name(ClaudeKeyStore.filename))
         self.index = index or CorpIndex()
         self.scan_store = scan_store or ScanStore(self.index.path.with_name("derivative_scan.sqlite"))
         self.session_key: str | None = None
@@ -1809,6 +1959,26 @@ class MainWindow(QMainWindow):
         self.keys.delete()
         self.refresh_key_state()
         self.status("저장된 인증키를 삭제했습니다.")
+
+    def ask_claude_key(self) -> bool:
+        dialog = ClaudeKeyDialog(self)
+        if dialog.exec() != QDialog.Accepted:
+            return False
+        try:
+            self.claude_keys.save(dialog.value)
+        except (KeyStoreError, OSError) as exc:
+            QMessageBox.warning(self, "저장 실패", f"Claude API 키를 저장하지 못했습니다.\n{exc}")
+            return False
+        self.status("Claude API 키를 암호화해서 저장했습니다.")
+        self.settings.refresh_state()
+        self.agent_page.credentials_changed()
+        return True
+
+    def forget_claude_key(self):
+        self.claude_keys.delete()
+        self.settings.refresh_state()
+        self.agent_page.credentials_changed()
+        self.status("저장된 Claude API 키를 삭제했습니다.")
 
     def refresh_key_state(self):
         self.key_badge.setText("● 인증키 준비됨" if self.has_key() else "○ 인증키 필요")

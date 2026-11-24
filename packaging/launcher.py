@@ -87,7 +87,7 @@ def _self_check(output: Path) -> int:
     output.write_text(json.dumps(results, ensure_ascii=False, indent=1), encoding="utf-8")
     required = (results["key_encrypts"], results["catalog"] == 85, results["chart_png"], results["svg_plugin"], results["window"],
                 results["tls_status"] == 200, not outside, results["frozen"], results["contract_parse"], results["scan_store"],
-                results["agent_sdk"])
+                results["agent_sdk"], results["api_key_path"] is True)
     return 0 if all(required) else 1
 
 
@@ -117,6 +117,20 @@ def _feature_check(folder: Path) -> dict[str, object]:
         results["agent_sdk"] = server.get("type") == "sdk"
     except Exception as exc:
         results["agent_sdk"] = f"{type(exc).__name__}: {exc}"
+    try:
+        # Claude Code 로그인이 없을 때 쓰는 API 키 경로. 실제 키나 네트워크는 쓰지 않는다.
+        import anthropic
+
+        from dart_guide.agent import _http_client
+        from dart_guide.keystore import ClaudeKeyStore
+
+        claude_store = ClaudeKeyStore(folder / "check_claude.bin")
+        sample = "sk-ant-api03-" + "x" * 90
+        claude_store.save(sample)
+        anthropic.AsyncAnthropic(api_key=sample, http_client=_http_client())
+        results["api_key_path"] = claude_store.load() == sample and sample.encode() not in claude_store.path.read_bytes()
+    except Exception as exc:
+        results["api_key_path"] = f"{type(exc).__name__}: {exc}"
     results["claude_code_found"] = bool(find_cli())
     return results
 
@@ -125,7 +139,7 @@ def _agent_check(output: Path) -> int:
     """설치된 Claude Code 로그인으로 짧은 질문 하나를 보내 도구 호출까지 확인한다. 구독 사용량이 조금 쓰인다."""
     import threading
 
-    from dart_guide.agent import ClaudeAgent, DartTools, check_login
+    from dart_guide.agent import AgentError, ClaudeAgent, DartTools, check_login, test_api_key
     from dart_guide.client import DartClient
     from dart_guide.corp_index import CorpIndex
     from dart_guide.keystore import KeyStore
@@ -145,10 +159,16 @@ def _agent_check(output: Path) -> int:
         finished.wait(240)
         agent.close()
     answer = "".join(text for kind, text in events if kind == "delta").strip()
+    # API 키 경로는 일부러 틀린 키로 실제 서버까지 다녀와 거절 안내가 나오는지만 본다. 요금은 들지 않는다.
+    try:
+        api_check = test_api_key("sk-ant-api03-" + "0" * 90)
+    except AgentError as exc:
+        api_check = str(exc)
     results = {"login": status.message, "tools": [t for k, t in events if k == "tool"], "answer": answer[-300:],
-               "errors": [t for k, t in events if k == "error"]}
+               "errors": [t for k, t in events if k == "error"], "api_invalid_key": api_check}
     output.write_text(json.dumps(results, ensure_ascii=False, indent=1), encoding="utf-8")
-    return 0 if status.ready and "00126380" in answer and results["tools"] and not results["errors"] else 1
+    passed = status.ready and "00126380" in answer and results["tools"] and not results["errors"]
+    return 0 if passed and "API 키가 올바르지" in api_check else 1
 
 
 def main() -> int:

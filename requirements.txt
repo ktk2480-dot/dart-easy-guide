@@ -2,3 +2,4 @@ PySide6>=6.6
 requests>=2.32
 matplotlib>=3.8
 claude-agent-sdk>=0.2.188
+anthropic>=2.1

@@ -36,7 +36,7 @@ VersionInfoDescription={#AppName} 설치 프로그램
 Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
 
 [Messages]
-WelcomeLabel2=[name/ver]을(를) 설치합니다.%n%n금융감독원 OpenDART의 공시를 코딩 없이 조회하는 프로그램입니다. 금융감독원의 공식 프로그램이 아니며, 결과는 투자 권유가 아닌 참고 자료입니다.%n%nAI 에이전트는 이 PC의 Claude Code 로그인을 사용하며 API 키는 쓰지 않습니다.%n%n관리자 권한 없이 현재 Windows 사용자에게만 설치됩니다.
+WelcomeLabel2=[name/ver]을(를) 설치합니다.%n%n금융감독원 OpenDART의 공시를 코딩 없이 조회하는 프로그램입니다. 금융감독원의 공식 프로그램이 아니며, 결과는 투자 권유가 아닌 참고 자료입니다.%n%nAI 에이전트는 이 PC의 Claude Code 로그인을 먼저 쓰고, 로그인이 없을 때만 등록한 Claude API 키를 씁니다.%n%n관리자 권한 없이 현재 Windows 사용자에게만 설치됩니다.
 
 [Tasks]
 Name: "desktopicon"; Description: "바탕화면에 바로 가기 만들기"
@@ -69,6 +69,8 @@ begin
   { 이 프로그램이 만든 파일만 지우고, 다른 파일이 있으면 폴더를 남긴다. }
   DeleteFile(Folder + '\api_key.bin');
   DeleteFile(Folder + '\api_key.tmp');
+  DeleteFile(Folder + '\claude_api_key.bin');
+  DeleteFile(Folder + '\claude_api_key.tmp');
   DeleteFile(Folder + '\corp_index.sqlite');
   DeleteFile(Folder + '\corp_index.tmp');
   DeleteFile(Folder + '\derivative_scan.sqlite');
@@ -93,7 +95,7 @@ begin
   if UninstallSilent then
     ShouldRemove := ExpandConstant('{param:DELETEUSERDATA|0}') = '1'
   else
-    ShouldRemove := MsgBox('저장된 인증키, 회사 목록, 파생 전수조사 결과도 함께 삭제할까요?' + #13#10 + #13#10 +
+    ShouldRemove := MsgBox('저장된 인증키(OpenDART, Claude API), 회사 목록, 파생 전수조사 결과도 함께 삭제할까요?' + #13#10 + #13#10 +
       '[아니요]를 누르면 다시 설치했을 때 그대로 사용할 수 있습니다.',
       mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES;
   if ShouldRemove then
