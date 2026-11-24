@@ -62,7 +62,16 @@ def _license_name(meta) -> str:
     return (meta.get("License") or "패키지 라이선스 파일 참고").splitlines()[0][:80]
 
 
-def write_notices(target: Path) -> None:
+def bundled_packages(modules_file: Path) -> list[str]:
+    """PyInstaller가 실제로 넣은 모듈을 설치된 패키지 이름으로 바꾼다. 고정 목록에 없는 의존성도 고지에 들어가게 한다."""
+    owners = metadata.packages_distributions()
+    found = {dist for name in modules_file.read_text(encoding="utf-8").split() for dist in owners.get(name, [])}
+    found.discard("pyinstaller")
+    known = {p.lower() for p in PACKAGES}
+    return list(PACKAGES) + sorted((d for d in found if d.lower() not in known), key=str.lower)
+
+
+def write_notices(target: Path, packages: list[str]) -> None:
     licenses = target / "licenses"
     licenses.mkdir(exist_ok=True)
     lines = [f"{APP_NAME} {__version__} 오픈소스 고지", "",
@@ -71,11 +80,16 @@ def write_notices(target: Path) -> None:
     python_license = Path(sys.base_prefix) / "LICENSE.txt"
     if python_license.is_file():
         shutil.copy(python_license, licenses / "Python_LICENSE.txt")
-    for package in PACKAGES:
+    seen = set()
+    for package in packages:
         try:
             dist = metadata.distribution(package)
         except metadata.PackageNotFoundError:
             continue
+        key = re.sub(r"[-_.]+", "-", dist.metadata["Name"]).lower()
+        if key in seen:
+            continue
+        seen.add(key)
         lines.append(f"{dist.metadata['Name']} {dist.version}  ({_license_name(dist.metadata)})")
         for file in dist.files or []:
             text = str(file).replace("\\", "/")
@@ -114,7 +128,7 @@ def main() -> int:
         target = RELEASE / "DartGuide"
         guide = (ROOT / "packaging" / "사용방법.txt").read_text(encoding="utf-8").replace("\r\n", "\n").replace("\n", "\r\n")
         (target / "사용방법.txt").write_text(guide, encoding="utf-8-sig", newline="")
-        write_notices(target)
+        write_notices(target, bundled_packages(work / "modules.txt"))
         archive = RELEASE / f"DartGuide_v{__version__}_Windows_x64.zip"
         make_zip(target, archive)
         folder_size = sum(f.stat().st_size for f in target.rglob("*") if f.is_file()) / 1048576

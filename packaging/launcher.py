@@ -35,6 +35,7 @@ def _self_check(output: Path) -> int:
     from dart_guide.catalog import load_catalog
     from dart_guide.client import _new_session
     from dart_guide.corp_index import CorpIndex
+    from dart_guide.derivative_scan import ScanStore
     from dart_guide.examples import EXAMPLES
     from dart_guide.guide import build_guide_report
     from dart_guide.keystore import KeyStore
@@ -59,7 +60,9 @@ def _self_check(output: Path) -> int:
         results["report_pdf_pages"] = export_pdf(Report("점검", sections=[Section("차트", chart=chart)]), folder / "report.pdf")
         results["guide_pdf_pages"] = export_pdf(build_guide_report(), output.with_suffix(".pdf"))
         results["svg_plugin"] = not QImage(str(Path(ui.__file__).parent / "data" / "chevron.svg")).isNull()
-        window = ui.MainWindow(keys=KeyStore(folder / "none.bin"), index=CorpIndex(folder / "none.sqlite"))
+        results.update(_feature_check(folder))
+        window = ui.MainWindow(keys=KeyStore(folder / "none.bin"), index=CorpIndex(folder / "none.sqlite"),
+                               scan_store=ScanStore(folder / "scan.sqlite"))
         window.resize(1320, 860)
         window.show()
         window.open_example(next(e for e in EXAMPLES if e.key == "performance"))
@@ -67,6 +70,7 @@ def _self_check(output: Path) -> int:
         window.grab().save(str(output.with_suffix(".png")))
         results["window"] = window.isVisible()
         window.close()
+        qt_app.processEvents()
 
     try:
         results["tls_status"] = _new_session().get("https://opendart.fss.or.kr/", timeout=20).status_code
@@ -82,8 +86,69 @@ def _self_check(output: Path) -> int:
     results["modules_outside_bundle"] = outside[:10]
     output.write_text(json.dumps(results, ensure_ascii=False, indent=1), encoding="utf-8")
     required = (results["key_encrypts"], results["catalog"] == 85, results["chart_png"], results["svg_plugin"], results["window"],
-                results["tls_status"] == 200, not outside, results["frozen"])
+                results["tls_status"] == 200, not outside, results["frozen"], results["contract_parse"], results["scan_store"],
+                results["agent_sdk"])
     return 0 if all(required) else 1
+
+
+def _feature_check(folder: Path) -> dict[str, object]:
+    """업체 분석·파생 전수조사·AI 에이전트 구성요소가 배포판 안에서 불러와지는지 본다. 네트워크와 Claude는 쓰지 않는다."""
+    from dart_guide.agent import DartTools, _build_server, find_cli
+    from dart_guide.corp_index import CorpIndex
+    from dart_guide.derivative_contracts import parse_table
+    from dart_guide.derivative_scan import ScanStore
+    from dart_guide.filing import parse_document
+
+    results: dict[str, object] = {}
+    sections = parse_document(
+        "<DOCUMENT><BODY><SECTION-1><TITLE>5. 위험관리 및 파생거래</TITLE><P>(단위 : USD)</P><TABLE>"
+        "<TR><TH>구분</TH><TH>계약처</TH><TH>계약금액</TH><TH>약정환율</TH><TH>만기일</TH></TR>"
+        "<TR><TD>통화선도</TD><TD>은행</TD><TD>1,000,000</TD><TD>1,300.00</TD><TD>2099.12.31</TD></TR>"
+        "</TABLE></SECTION-1></BODY></DOCUMENT>")
+    table = next(b for s in sections for b in s.blocks if not isinstance(b, str))
+    contracts = parse_table(table, 2025, "점검", sections[0].title)
+    results["contract_parse"] = [(c.instrument, c.currency, c.notional) for c in contracts] == [("통화선도", "USD", 1_000_000)]
+    store = ScanStore(folder / "check_scan.sqlite")
+    results["scan_store"] = store.stats([2025], ["Y"])["total"] == 0
+    try:
+        import anyio._backends._asyncio  # noqa: F401  실행 시점에 이름으로 불러오는 모듈
+
+        server = _build_server(DartTools(lambda: None, CorpIndex(folder / "none.sqlite")))
+        results["agent_sdk"] = server.get("type") == "sdk"
+    except Exception as exc:
+        results["agent_sdk"] = f"{type(exc).__name__}: {exc}"
+    results["claude_code_found"] = bool(find_cli())
+    return results
+
+
+def _agent_check(output: Path) -> int:
+    """설치된 Claude Code 로그인으로 짧은 질문 하나를 보내 도구 호출까지 확인한다. 구독 사용량이 조금 쓰인다."""
+    import threading
+
+    from dart_guide.agent import ClaudeAgent, DartTools, check_login
+    from dart_guide.client import DartClient
+    from dart_guide.corp_index import CorpIndex
+    from dart_guide.keystore import KeyStore
+
+    status = check_login()
+    events: list[tuple[str, str]] = []
+    finished = threading.Event()
+
+    def on_event(kind: str, text: str) -> None:
+        events.append((kind, text))
+        if kind in ("done", "error"):
+            finished.set()
+
+    if status.ready:
+        agent = ClaudeAgent(DartTools(lambda: DartClient(KeyStore().load()), CorpIndex()), on_event)
+        agent.send("search_company 도구로 '삼성전자'를 찾아, 그 고유번호 8자리 숫자만 답하세요.")
+        finished.wait(240)
+        agent.close()
+    answer = "".join(text for kind, text in events if kind == "delta").strip()
+    results = {"login": status.message, "tools": [t for k, t in events if k == "tool"], "answer": answer[-300:],
+               "errors": [t for k, t in events if k == "error"]}
+    output.write_text(json.dumps(results, ensure_ascii=False, indent=1), encoding="utf-8")
+    return 0 if status.ready and "00126380" in answer and results["tools"] and not results["errors"] else 1
 
 
 def main() -> int:
@@ -92,6 +157,8 @@ def main() -> int:
         home = _prepare_environment()
         if "--self-check" in sys.argv:
             return _self_check(Path(sys.argv[sys.argv.index("--self-check") + 1]))
+        if "--agent-check" in sys.argv:
+            return _agent_check(Path(sys.argv[sys.argv.index("--agent-check") + 1]))
         from dart_guide.app import main as run_app
 
         return run_app()

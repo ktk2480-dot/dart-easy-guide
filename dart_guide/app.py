@@ -4,20 +4,27 @@ from __future__ import annotations
 import os
 import re
 import sys
-from datetime import date
+from dataclasses import replace
+from datetime import date, datetime
 from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QDate, QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices, QFont, QIcon, QPixmap, QPainter, QColor
+from PySide6.QtGui import QDesktopServices, QFont, QIcon, QPixmap, QPainter, QColor, QTextDocument
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSplitter, QStackedWidget,
-    QTextBrowser, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
+    QSplitter, QStackedWidget, QTableWidget, QTableWidgetItem, QTextBrowser, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QWidget,
 )
 
 from . import APP_NAME, __version__
+from .agent import AgentError, ClaudeAgent, ClaudeStatus, DartTools, check_login, open_login
+from .analysis import analyze_company, build_report, contract_tables, display_table
+from .derivative_contracts import Contract
+from .derivative_scan import KST, PRESETS, SCOPES, ScanRunner, ScanStore
+from .filing import FilingTable
 from .catalog import (
     BINARY_ENDPOINTS, KEY_APPLY_URL, MULTI_COMPANY_ENDPOINTS, PARAM_CHOICES, REPORT_CHOICES, guide_link, load_catalog,
 )
@@ -25,12 +32,12 @@ from .client import DartClient, DartError, KEY_ERROR_CODES, describe_call
 from .corp_index import Company, CorpIndex
 from .examples import (
     CATEGORIES, EXAMPLES, Example, RunInput, default_year, explorer_fetch, explorer_report, latest_for_endpoint,
-    run_example,
+    run_example, viewer_url,
 )
 from .formatting import months_ago
 from .guide import KEY_STEPS, build_guide_report, glossary_html
 from .keystore import KeyStore, KeyStoreError, is_valid_key, mask_key
-from .report import Report, apply_to_document, export_pdf
+from .report import Report, Section, Table, apply_to_document, export_pdf
 
 POPULAR = [("삼성전자", "005930"), ("SK하이닉스", "000660"), ("현대차", "005380"), ("NAVER", "035420"), ("카카오", "035720")]
 
@@ -69,6 +76,9 @@ QLineEdit:focus, QComboBox:focus, QDateEdit:focus { border: 1px solid #2a78d6; }
 QComboBox::drop-down, QDateEdit::drop-down { border: none; width: 24px; }
 QComboBox::down-arrow, QDateEdit::down-arrow { image: url("__CHEVRON__"); width: 12px; height: 12px; }
 QTextBrowser { background: #ffffff; border: 1px solid #dfe4ea; border-radius: 10px; padding: 14px; }
+QTableWidget { background: #ffffff; border: 1px solid #dfe4ea; border-radius: 6px; gridline-color: #eef1f5; outline: none; }
+QTableWidget::item:selected { background: #dceafb; color: #10233f; }
+QHeaderView::section { background: #edf1f6; color: #26364b; border: none; padding: 5px; font-weight: 700; }
 QListWidget, QTreeWidget { background: #ffffff; border: 1px solid #dfe4ea; border-radius: 6px; outline: none; }
 QListWidget::item, QTreeWidget::item { padding: 4px; }
 QListWidget::item:selected, QTreeWidget::item:selected { background: #dceafb; color: #10233f; }
@@ -924,6 +934,626 @@ class ExplorerPage(QWidget):
         self.main.run_task(job, finish, fail, "파일 내려받는 중")
 
 
+class AnalysisPage(QWidget):
+    """업체명을 고르면 업체정보, 3개년 재무, 수출입, 파생거래를 한 번에 보여 준다."""
+
+    def __init__(self, main: "MainWindow"):
+        super().__init__()
+        self.setObjectName("page")
+        self.main = main
+        self.company: Company | None = None
+        self._run_id = 0
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(24, 20, 24, 14)
+        outer.setSpacing(10)
+        top = QHBoxLayout()
+        titles = QVBoxLayout()
+        titles.setSpacing(0)
+        titles.addWidget(label("업체 분석", "h1"))
+        titles.addWidget(label("업체명을 입력하면 최근 3개년 사업보고서나 감사보고서를 읽어 한 번에 정리합니다.", "muted"))
+        top.addLayout(titles, 1)
+        self.ai_button = QPushButton("AI 종합 의견")
+        self.ai_button.setToolTip("이 업체의 분석 자료를 AI 에이전트가 읽고 핵심과 위험 요인을 정리합니다.")
+        self.ai_button.setEnabled(False)
+        self.ai_button.clicked.connect(self._ask_ai)
+        top.addWidget(self.ai_button)
+        self.pdf_button = QPushButton("PDF로 저장")
+        self.pdf_button.setObjectName("primary")
+        self.pdf_button.setEnabled(False)
+        self.pdf_button.clicked.connect(lambda: main.save_report(self.view.report))
+        top.addWidget(self.pdf_button)
+        outer.addLayout(top)
+        body = QHBoxLayout()
+        body.setSpacing(14)
+        side = QFrame(objectName="panel")
+        side.setFixedWidth(330)
+        form = QVBoxLayout(side)
+        form.setContentsMargins(15, 15, 15, 15)
+        form.setSpacing(7)
+        form.addWidget(label("업체명", "h2"))
+        self.picker = CompanyPicker(main)
+        self.picker.changed.connect(self._picked)
+        form.addWidget(self.picker)
+        self.run_button = QPushButton("다시 분석")
+        self.run_button.setEnabled(False)
+        self.run_button.clicked.connect(self.run)
+        form.addWidget(self.run_button)
+        form.addSpacing(8)
+        form.addWidget(label("분석 항목", "h2"))
+        for text in ("1. 업체정보", "2. 3개년 재무정보", "3. 3개년 수출/수입 분석", "4. 3개년 파생거래 내역", "5. 공시 한계와 추가 확인 자료"):
+            form.addWidget(label(text))
+        form.addStretch(1)
+        form.addWidget(label("공시 원문의 표를 읽어 만들며, 합계를 확인할 수 없는 값은 추정하지 않습니다. 거래한도 산정 증빙으로는 별도 자료가 필요합니다.", "muted", True))
+        body.addWidget(side)
+        self.view = ReportView()
+        self.view.show_message("업체명을 입력해 주세요", "목록에서 회사를 고르면 바로 분석을 시작합니다.")
+        body.addWidget(self.view, 1)
+        outer.addLayout(body, 1)
+
+    def _picked(self):
+        self.company = self.picker.selected[0] if self.picker.selected else None
+        self.run_button.setEnabled(bool(self.company))
+        self.ai_button.setEnabled(False)
+        self.pdf_button.setEnabled(False)
+        if self.company:
+            self.run()
+        else:
+            self._run_id += 1
+            self.view.show_message("업체명을 입력해 주세요", "목록에서 회사를 고르면 바로 분석을 시작합니다.")
+
+    def run(self):
+        company = self.company
+        key = self.main.require_key()
+        if not company or not key:
+            return
+        self._run_id += 1
+        run_id = self._run_id
+        self.run_button.setEnabled(False)
+        self.ai_button.setEnabled(False)
+        self.pdf_button.setEnabled(False)
+        self.view.show_message(f"{company.corp_name} 분석 중입니다", "최근 3개년 공시 원문을 읽고 있습니다. 보통 10초 안팎 걸립니다.")
+
+        def job():
+            return build_report(analyze_company(self.main.make_client(key), company))
+
+        def finish(report: Report):
+            if run_id != self._run_id:
+                return
+            self.run_button.setEnabled(True)
+            self.view.show_report(report)
+            self.ai_button.setEnabled(True)
+            self.pdf_button.setEnabled(True)
+
+        def fail(error: DartError):
+            if run_id != self._run_id:
+                return
+            self.run_button.setEnabled(True)
+            self.view.show_message("분석하지 못했습니다", error.message)
+
+        self.main.run_task(job, finish, fail, f"{company.corp_name} 분석 중")
+
+    def _ask_ai(self):
+        if self.company:
+            self.main.ask_agent(
+                f"{self.company.corp_name}(고유번호 {self.company.corp_code})의 업체 분석 자료를 읽고 종합 의견을 정리해 줘. "
+                "사업과 재무 흐름, 수출입 구조, 파생거래와 환위험, 눈여겨볼 위험 요인 순서로 써 줘."
+            )
+
+
+def fix_bold(text: str) -> str:
+    """'**9.6%**로'처럼 문장부호와 한글이 붙으면 마크다운 굵게가 풀리므로 그 경계에 아주 좁은 공백을 넣는다."""
+    def mark(match: re.Match) -> str:
+        inner = match.group(1)
+        before = " " if not inner[0].isalnum() and match.start() and text[match.start() - 1].isalnum() else ""
+        after = " " if not inner[-1].isalnum() and match.end() < len(text) and text[match.end()].isalnum() else ""
+        return f"{before}**{inner}**{after}"
+    return re.sub(r"\*\*([^*\n]+?)\*\*", mark, text)
+
+
+class AgentPage(QWidget):
+    """Claude Code 로그인으로 동작하는 대화 화면."""
+    agent_event = Signal(str, str)
+    SUGGESTIONS = ("삼성전자 환위험과 파생거래 요약해 줘", "현대차와 기아 수출 비중 비교해 줘", "농심 최근 3년 재무 흐름 알려 줘")
+
+    def __init__(self, main: "MainWindow"):
+        super().__init__()
+        self.setObjectName("page")
+        self.main = main
+        self.agent: ClaudeAgent | None = None
+        self.messages: list[list[str]] = []
+        self.busy = False
+        self.activity = ""
+        self.agent_event.connect(self._on_event, Qt.QueuedConnection)
+        self._render_timer = QTimer(self, singleShot=True, interval=120)
+        self._render_timer.timeout.connect(self._render)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(24, 20, 24, 14)
+        outer.setSpacing(9)
+        top = QHBoxLayout()
+        titles = QVBoxLayout()
+        titles.setSpacing(0)
+        titles.addWidget(label("AI 에이전트", "h1"))
+        self.state = label("Claude Code 로그인을 확인하는 중입니다.", "muted")
+        titles.addWidget(self.state)
+        top.addLayout(titles, 1)
+        self.login_button = QPushButton("Claude 로그인")
+        self.login_button.setToolTip("Claude Code의 공식 로그인 창을 엽니다. 이 앱은 계정 정보를 받지 않습니다.")
+        self.login_button.clicked.connect(self._login)
+        self.login_button.hide()
+        top.addWidget(self.login_button)
+        self.new_button = QPushButton("새 대화")
+        self.new_button.clicked.connect(self.reset)
+        top.addWidget(self.new_button)
+        outer.addLayout(top)
+        self.view = QTextBrowser()
+        self.view.setOpenLinks(False)
+        self.view.anchorClicked.connect(safe_open)
+        outer.addWidget(self.view, 1)
+        self.quick = QWidget()
+        quick_row = QHBoxLayout(self.quick)
+        quick_row.setContentsMargins(0, 0, 0, 0)
+        quick_row.setSpacing(6)
+        for text in self.SUGGESTIONS:
+            button = QPushButton(text, objectName="quick")
+            button.clicked.connect(lambda _=False, t=text: self.submit(t))
+            quick_row.addWidget(button)
+        quick_row.addStretch(1)
+        outer.addWidget(self.quick)
+        row = QHBoxLayout()
+        self.input = QPlainTextEdit()
+        self.input.setPlaceholderText("공시에 대해 물어보세요. Enter로 보내고 Shift+Enter로 줄을 바꿉니다.")
+        self.input.setFixedHeight(66)
+        self.input.setStyleSheet("QPlainTextEdit { background:#ffffff; border:1px solid #c9d1db; border-radius:6px; padding:5px; }")
+        self.input.installEventFilter(self)
+        row.addWidget(self.input, 1)
+        self.send_button = QPushButton("보내기")
+        self.send_button.setObjectName("primary")
+        self.send_button.clicked.connect(self._send_clicked)
+        row.addWidget(self.send_button)
+        outer.addLayout(row)
+        outer.addWidget(label("질문과 조회한 공시는 내 Claude 계정으로 전송됩니다. 고객정보나 회사 내부 자료는 입력하지 마세요. AI 답변은 원문으로 확인해 주세요.", "muted", True))
+        self._render()
+
+    def eventFilter(self, watched, event):
+        if watched is self.input and event.type() == event.Type.KeyPress and event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if not event.modifiers() & Qt.ShiftModifier:
+                self._send_clicked()
+                return True
+        return super().eventFilter(watched, event)
+
+    def refresh_login(self):
+        def done(status: ClaudeStatus):
+            suffix = f" 로그인 만료 예정: {status.expires}" if status.ready and status.expires else ""
+            self.state.setText(("● " if status.ready else "○ ") + status.message + suffix)
+            self.login_button.setVisible(not status.ready)
+
+        self.main.run_task(check_login, done, lambda _e: self.state.setText("○ Claude Code 상태를 확인하지 못했습니다."), "Claude 로그인 확인 중", handle_key_error=False)
+
+    def _login(self):
+        try:
+            open_login()
+        except (AgentError, OSError) as exc:
+            QMessageBox.warning(self, "Claude 로그인", str(exc) if isinstance(exc, AgentError) else "로그인 창을 열지 못했습니다.")
+            return
+        QMessageBox.information(self, "Claude 로그인", "열린 창의 안내에 따라 브라우저에서 로그인을 마친 뒤 확인을 눌러 주세요.")
+        self.refresh_login()
+
+    def _send_clicked(self):
+        if self.busy:
+            if self.agent:
+                self.activity = "멈추는 중"
+                self.agent.stop()
+                self._render()
+            return
+        text = self.input.toPlainText().strip()
+        if text:
+            self.input.clear()
+            self.submit(text)
+
+    def submit(self, text: str):
+        if self.busy:
+            self.main.status("이전 답변이 끝난 뒤 다시 보내 주세요.")
+            return
+        key = self.main.require_key()
+        if not key:
+            return
+        self.main.with_index(lambda: self._start(text, key))
+
+    def _start(self, text: str, key: str):
+        if self.busy:
+            return
+        if self.agent is None:
+            tools = DartTools(lambda: self.main.make_client(self.main.session_key or key), self.main.index)
+            self.agent = ClaudeAgent(tools, self.agent_event.emit)
+        self.messages += [["user", text], ["assistant", ""]]
+        self._set_busy(True, "생각하는 중")
+        self._render()
+        self.agent.send(text)
+
+    def _set_busy(self, busy: bool, activity: str = ""):
+        self.busy, self.activity = busy, activity
+        self.send_button.setText("멈추기" if busy else "보내기")
+        self.send_button.setObjectName("" if busy else "primary")
+        self.send_button.style().unpolish(self.send_button)
+        self.send_button.style().polish(self.send_button)
+        self.quick.setVisible(not busy and not self.messages)
+        self.new_button.setEnabled(not busy)
+
+    @Slot(str, str)
+    def _on_event(self, kind: str, text: str):
+        if not self.busy:
+            return
+        if kind == "delta":
+            self.messages[-1][1] += text
+            self.activity = "답변 작성 중"
+            self._render_timer.start()
+        elif kind == "tool":
+            self.activity = text
+            self._render_timer.start()
+        elif kind == "done":
+            if not self.messages[-1][1]:
+                self.messages[-1][1] = "_답변을 멈췄습니다._"
+            self._set_busy(False)
+            self._render()
+        elif kind == "error":
+            self.messages[-1][1] += f"\n\n**오류:** {text}"
+            self._set_busy(False)
+            self._render()
+            self.refresh_login()
+
+    def _render(self):
+        bar = self.view.verticalScrollBar()
+        follow = bar.value() >= bar.maximum() - 40
+        position = bar.value()
+        if not self.messages:
+            self.view.setHtml(
+                '<div align="center" style="margin-top:70px;"><p style="font-size:14pt;font-weight:700;color:#173b6c;">무엇을 분석할까요?</p>'
+                '<p style="color:#5b6470;">회사 이름과 궁금한 점을 적으면 공시를 찾아 읽고 근거와 함께 답합니다.</p></div>'
+            )
+            return
+        parts = []
+        for role, content in self.messages:
+            parts.append(f"#### {'나' if role == 'user' else 'Claude'}\n\n{fix_bold(content) if role == 'assistant' else content}\n")
+        if self.busy and self.activity:
+            parts.append(f"\n_{self.activity}…_\n")
+        features = QTextDocument.MarkdownFeature.MarkdownDialectGitHub | QTextDocument.MarkdownFeature.MarkdownNoHTML
+        self.view.document().setMarkdown("\n".join(parts), features)
+        bar.setValue(bar.maximum() if follow else position)
+
+    def reset(self):
+        if self.busy:
+            return
+        self.shutdown()
+        self.messages = []
+        self._set_busy(False)
+        self._render()
+
+    def shutdown(self):
+        agent, self.agent = self.agent, None
+        if agent:
+            agent.close()
+
+
+class ScanPage(QWidget):
+    """전체 공시 기업의 파생거래 기재 내역을 사용량을 조절하며 조사한다."""
+    COLUMNS = ("회사", "구분", "사업연도", "기재 상태", "상품", "액면 합계(통화별)")
+
+    def __init__(self, main: "MainWindow"):
+        super().__init__()
+        self.setObjectName("page")
+        self.main = main
+        self.store: ScanStore = main.scan_store
+        self.runner = ScanRunner(self.store)
+        self._was_running = False
+        self._last_done = -1
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(24, 20, 24, 14)
+        outer.setSpacing(10)
+        top = QHBoxLayout()
+        titles = QVBoxLayout()
+        titles.setSpacing(0)
+        titles.addWidget(label("파생거래 전수조사", "h1"))
+        titles.addWidget(label("DART 공시 기업의 파생상품 기재 내역을 사용량을 조절하며 조사합니다. 중단해도 이어서 실행됩니다.", "muted"))
+        top.addLayout(titles, 1)
+        self.csv_button = QPushButton("CSV로 저장")
+        self.csv_button.setObjectName("primary")
+        self.csv_button.clicked.connect(self._export)
+        top.addWidget(self.csv_button)
+        outer.addLayout(top)
+        body = QHBoxLayout()
+        body.setSpacing(14)
+        side = QFrame(objectName="panel")
+        side.setFixedWidth(330)
+        form = QVBoxLayout(side)
+        form.setContentsMargins(15, 13, 15, 13)
+        form.setSpacing(5)
+        form.addWidget(label("사업연도", "h2"))
+        year_row = QHBoxLayout()
+        self.year_boxes: dict[int, QCheckBox] = {}
+        latest = default_year()
+        for year in (latest, latest - 1, latest - 2):
+            box = QCheckBox(f"{year}")
+            box.setChecked(year == latest)
+            box.toggled.connect(self._selection_changed)
+            self.year_boxes[year] = box
+            year_row.addWidget(box)
+        year_row.addStretch(1)
+        form.addLayout(year_row)
+        form.addWidget(label("조사 대상", "h2"))
+        self.scope_boxes: dict[str, QCheckBox] = {}
+        for key, scope in SCOPES.items():
+            text = scope.label + (" (연 약 4만 건)" if key == "AUDIT" else "")
+            box = QCheckBox(text)
+            box.setChecked(key != "AUDIT")
+            box.toggled.connect(self._selection_changed)
+            self.scope_boxes[key] = box
+            form.addWidget(box)
+        form.addWidget(label("사용량", "h2"))
+        self.speed = QComboBox()
+        for policy in PRESETS:
+            self.speed.addItem(policy.label, policy)
+        self.speed.view().setMinimumWidth(400)
+        self.speed.currentIndexChanged.connect(self._refresh)
+        form.addWidget(self.speed)
+        self.office = QCheckBox("평일 09~18시에는 쉬기")
+        self.office.toggled.connect(self._refresh)
+        form.addWidget(self.office)
+        form.addSpacing(4)
+        self.check_button = QPushButton("1. 대상 확인")
+        self.check_button.setToolTip("공시 목록만 읽어 조사할 보고서 수와 예상 사용량을 계산합니다.")
+        self.check_button.clicked.connect(self._discover)
+        form.addWidget(self.check_button)
+        self.run_button = QPushButton("2. 조회 시작")
+        self.run_button.setObjectName("primary")
+        self.run_button.clicked.connect(self._toggle)
+        form.addWidget(self.run_button)
+        self.retry_button = QPushButton("실패·미제공 건 다시 조회")
+        self.retry_button.clicked.connect(self._retry)
+        form.addWidget(self.retry_button)
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(False)
+        form.addWidget(self.bar)
+        self.state = label("", "", True)
+        form.addWidget(self.state)
+        self.counts = label("", "muted", True)
+        form.addWidget(self.counts)
+        self.usage = label("", "muted", True)
+        form.addWidget(self.usage)
+        form.addStretch(1)
+        body.addWidget(side)
+        right = QVBoxLayout()
+        right.setSpacing(7)
+        filters = QHBoxLayout()
+        self.search = QLineEdit(placeholderText="결과에서 회사명·종목코드 검색")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(lambda: self._filter_timer.start())
+        filters.addWidget(self.search, 1)
+        self.status_filter = QComboBox()
+        for text, value in (("상태 전체", ""), ("있음", "있음"), ("없음", "없음"), ("확인 필요", "확인 필요"), ("기재 없음", "기재 없음")):
+            self.status_filter.addItem(text, value)
+        self.status_filter.currentIndexChanged.connect(self._load_results)
+        filters.addWidget(self.status_filter)
+        self.fx_only = QCheckBox("외환 파생만")
+        self.fx_only.toggled.connect(self._load_results)
+        filters.addWidget(self.fx_only)
+        right.addLayout(filters)
+        self.result_note = label("", "muted")
+        right.addWidget(self.result_note)
+        splitter = QSplitter(Qt.Vertical)
+        self.table = QTableWidget(0, len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.verticalHeader().hide()
+        self.table.setShowGrid(False)
+        self.table.setAlternatingRowColors(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.Stretch)
+        header.setSectionResizeMode(5, QHeaderView.Stretch)
+        for column in (1, 2, 3):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        self.table.itemSelectionChanged.connect(self._show_detail)
+        splitter.addWidget(self.table)
+        self.view = ReportView()
+        self.view.show_message("회사를 선택하세요", "기재 내용과 근거 표, 원문 링크를 보여 줍니다.")
+        splitter.addWidget(self.view)
+        splitter.setSizes([360, 320])
+        right.addWidget(splitter, 1)
+        body.addLayout(right, 1)
+        outer.addLayout(body, 1)
+        self._filter_timer = QTimer(self, singleShot=True, interval=220)
+        self._filter_timer.timeout.connect(self._load_results)
+        self.timer = QTimer(self, interval=1500)
+        self.timer.timeout.connect(self._tick)
+
+    def _selected(self) -> tuple[list[int], list[str]]:
+        return ([y for y, box in self.year_boxes.items() if box.isChecked()],
+                [k for k, box in self.scope_boxes.items() if box.isChecked()])
+
+    def _policy(self):
+        return replace(self.speed.currentData(), skip_office_hours=self.office.isChecked())
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.timer.start()
+        self._refresh()
+        self._load_results()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        if not self.runner.running:
+            self.timer.stop()
+
+    def _selection_changed(self):
+        self._refresh()
+        self._load_results()
+
+    def _tick(self):
+        running = self.runner.running
+        if self._was_running and not running:
+            self._was_running = False
+            self._refresh()
+            self._load_results()
+            if self.runner.error:
+                QMessageBox.warning(self, "파생거래 전수조사", self.runner.error)
+            return
+        self._was_running = running
+        if self.isVisible():
+            self._refresh()
+            if running and self._last_done >= 0 and self.table.rowCount() < 500:
+                self._load_results(keep=True)
+
+    def _refresh(self):
+        years, scopes = self._selected()
+        running = self.runner.running
+        stats = self.store.stats(years, scopes)
+        finished = stats["done"] + stats["failed"] + stats["nofile"]
+        self.bar.setRange(0, max(stats["total"], 1))
+        self.bar.setValue(finished)
+        self.check_button.setEnabled(not running and bool(years and scopes))
+        self.retry_button.setEnabled(not running and bool(stats["failed"] + stats["nofile"]))
+        scanning = running and self.runner.mode == "scan"
+        self.run_button.setText("일시정지" if scanning else "멈추기" if running else ("이어서 조회" if finished and stats["pending"] else "2. 조회 시작"))
+        self.run_button.setEnabled(running or bool(stats["pending"]))
+        for box in (*self.year_boxes.values(), *self.scope_boxes.values(), self.speed, self.office):
+            box.setEnabled(not running)
+        if running:
+            text = self.runner.status_text
+        elif self.runner.error:
+            text = self.runner.error
+        elif stats["pending"]:
+            text = "이어서 조회할 수 있습니다." if finished else "조회할 준비가 되었습니다."
+        elif stats["total"]:
+            text = "선택한 범위의 조회를 마쳤습니다."
+        else:
+            text = "먼저 대상 확인을 눌러 주세요."
+        if not running and stats["pending"] and not self.runner.error:
+            estimate = self.store.estimate(years, scopes, self._policy())
+            text += f"\n남은 {estimate['calls']:,}건 · 약 {estimate['mb'] / 1000:.1f}GB · 실행 약 {estimate['hours']:.1f}시간 (하루 한도 기준 {estimate['days']}일)"
+        self.state.setText(text)
+        self.counts.setText(f"완료 {finished:,} / 전체 {stats['total']:,}\n있음 {stats['있음']:,} (외환 {stats['fx']:,}) · 없음 {stats['없음']:,} · "
+                            f"확인 필요 {stats['확인 필요']:,} · 기재 없음 {stats['기재 없음']:,} · 실패·미제공 {stats['failed'] + stats['nofile']:,}")
+        calls, data = self.store.usage(datetime.now(KST).date().isoformat())
+        policy = self._policy()
+        self.usage.setText(f"오늘 사용: {calls:,} / {policy.calls_per_day:,}건 · {data / 1e6:,.0f} / {policy.mb_per_day:,.0f}MB")
+        self._last_done = finished
+
+    def _discover(self):
+        years, scopes = self._selected()
+        key = self.main.require_key()
+        if not key or not years or not scopes:
+            return
+        self.runner.start_discovery(lambda: self.main.make_client(key), years, scopes, self._policy())
+        self._was_running = True
+        self.timer.start()
+        self._refresh()
+
+    def _toggle(self):
+        if self.runner.running:
+            self.runner.stop()
+            self.state.setText("현재 건을 마치고 멈추는 중입니다.")
+            return
+        years, scopes = self._selected()
+        key = self.main.require_key()
+        if not key:
+            return
+        estimate = self.store.estimate(years, scopes, self._policy())
+        answer = QMessageBox.question(
+            self, "파생거래 전수조사",
+            f"{estimate['calls']:,}건을 조회합니다.\n\n예상 데이터: 약 {estimate['mb'] / 1000:.1f}GB\n예상 실행 시간: 약 {estimate['hours']:.1f}시간 "
+            f"(하루 한도 기준 {estimate['days']}일)\n\n조회 중에는 앱을 켜 두어야 합니다. 시작할까요?")
+        if answer != QMessageBox.Yes:
+            return
+        self.runner.start_scan(lambda: self.main.make_client(key), years, scopes, self._policy())
+        self._was_running = True
+        self.timer.start()
+        self._refresh()
+
+    def _retry(self):
+        years, scopes = self._selected()
+        count = self.store.retry_failed(years, scopes)
+        self.main.status(f"{count:,}건을 다시 조회 대기열에 넣었습니다.")
+        self._refresh()
+
+    def _filters(self) -> tuple:
+        years, scopes = self._selected()
+        return years, scopes, self.search.text(), self.status_filter.currentData(), self.fx_only.isChecked()
+
+    def _load_results(self, *_args, keep: bool = False):
+        selected = self._current_key() if keep else None
+        position = self.table.verticalScrollBar().value()
+        rows, total = self.store.results(*self._filters())
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            values = (f"{row['corp_name']} ({row['stock_code']})" if row["stock_code"] else row["corp_name"], SCOPES[row["scope"]].label,
+                      f"{row['year']}", row["status"], row["instruments"] or "-",
+                      row["notionals"] or ("액면 미공시" if row["status"] == "있음" else "-"))
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.UserRole, (row["corp_code"], row["period_end"]))
+                if column >= 4:
+                    item.setToolTip(value)
+                self.table.setItem(index, column, item)
+            if selected == (row["corp_code"], row["period_end"]):
+                self.table.selectRow(index)
+        self.table.blockSignals(False)
+        if keep:
+            self.table.verticalScrollBar().setValue(position)
+        self.result_note.setText(f"결과 {total:,}건" + (f" 중 {len(rows):,}건 표시 (전체는 CSV로 저장)" if total > len(rows) else ""))
+
+    def _current_key(self):
+        items = self.table.selectedItems()
+        return items[0].data(Qt.UserRole) if items else None
+
+    def _show_detail(self):
+        key = self._current_key()
+        if not key:
+            return
+        row, detail = self.store.detail(*key)
+        sections = []
+        contracts = [Contract(**item) for item in detail.get("contracts", [])]
+        if contracts:
+            totals, deals = contract_tables(contracts)
+            sections += [Section("상품별 액면 합계", table=totals), Section("계약 상세", table=deals)]
+        elif row["status"] == "있음":
+            sections.append(Section("상품별 액면", ["공시 표에서 액면(계약금액)을 찾지 못했습니다. 회사가 장부금액이나 평가손익만 공시했을 수 있습니다."]))
+        if detail["statements"]:
+            sections.append(Section("공시 내용", bullets=detail["statements"]))
+        for table in detail["tables"]:
+            sections.append(Section(table["title"][:60] or "파생 관련 표", table=display_table(FilingTable(table["rows"], "", table["unit"]))))
+        number = row["used_rcept"] or row["rcept_no"]
+        url = viewer_url(number)
+        if url:
+            sections.append(Section("원문 확인", table=Table(["보고서", "바로가기"], [[row["report_nm"], "원문 열기"]], links={(0, 1): url}, widths=[72, 28])))
+        summary = f"기재 상태: {row['status']}" + (f" · 상품: {row['instruments']}" if row["instruments"] else "")
+        self.view.show_report(Report(f"{row['corp_name']} {row['year']}년 파생거래", f"{row['source']} 기준 · 기말 잔액 중심이며 타행별 내역은 알 수 없습니다.",
+                                     [summary], sections=sections, file_stem=f"{row['corp_name']}_파생거래", show_disclaimer=False))
+
+    def _export(self):
+        filters = self._filters()
+        _, total = self.store.results(*filters, limit=1)
+        if not total:
+            QMessageBox.information(self, "CSV로 저장", "저장할 결과가 없습니다.")
+            return
+        default = downloads_dir() / f"파생거래_전수조사_{date.today():%Y%m%d}.csv"
+        path, _ = QFileDialog.getSaveFileName(self, "CSV로 저장", str(default), "CSV 파일 (*.csv)")
+        if not path:
+            return
+        try:
+            summary, tables, deals, count = self.store.export_csv(path, *filters)
+        except OSError:
+            QMessageBox.warning(self, "CSV로 저장", "파일을 저장하지 못했습니다. 같은 이름의 파일이 열려 있다면 닫고 다시 시도해 주세요.")
+            return
+        QMessageBox.information(self, "CSV로 저장", f"{count:,}건을 저장했습니다.\n{summary.name}\n{deals.name}\n{tables.name}")
+
+    def shutdown(self):
+        self.timer.stop()
+        self.runner.stop(wait=5)
+
+
 class GlossaryPage(QWidget):
     def __init__(self):
         super().__init__()
@@ -1043,11 +1673,13 @@ class SettingsPage(QWidget):
 class MainWindow(QMainWindow):
     task_finished = Signal(int, object, object)
 
-    def __init__(self, client_factory: Callable[[str], DartClient] = DartClient, keys: KeyStore | None = None, index: CorpIndex | None = None):
+    def __init__(self, client_factory: Callable[[str], DartClient] = DartClient, keys: KeyStore | None = None, index: CorpIndex | None = None,
+                 scan_store: ScanStore | None = None):
         super().__init__()
         self.make_client = client_factory
         self.keys = keys or KeyStore()
         self.index = index or CorpIndex()
+        self.scan_store = scan_store or ScanStore(self.index.path.with_name("derivative_scan.sqlite"))
         self.session_key: str | None = None
         self.last_company: Company | None = None
         self.pool = QThreadPool(self)
@@ -1076,17 +1708,22 @@ class MainWindow(QMainWindow):
         nav_box.addSpacing(16)
         self.stack = QStackedWidget()
         self.home = HomePage(self)
+        self.analysis = AnalysisPage(self)
+        self.agent_page = AgentPage(self)
+        self.scan_page = ScanPage(self)
         self.examples = ExamplesPage(self)
         self.runner = RunnerPage(self)
         self.explorer = ExplorerPage(self)
         self.glossary = GlossaryPage()
         self.settings = SettingsPage(self)
-        self.pages = {"home": self.home, "examples": self.examples, "runner": self.runner, "explorer": self.explorer, "glossary": self.glossary, "settings": self.settings}
+        self.pages = {"home": self.home, "analysis": self.analysis, "scan": self.scan_page, "agent": self.agent_page, "examples": self.examples, "runner": self.runner,
+                      "explorer": self.explorer, "glossary": self.glossary, "settings": self.settings}
         for page in self.pages.values():
             self.stack.addWidget(page)
         self.nav_group = QButtonGroup(self)
         self.nav_buttons: dict[str, QPushButton] = {}
-        for key, text in (("home", "시작하기"), ("examples", "예제로 시작"), ("explorer", "전체 API"), ("glossary", "용어 사전"), ("settings", "인증키·설정")):
+        for key, text in (("home", "시작하기"), ("analysis", "업체 분석"), ("scan", "파생 전수조사"), ("agent", "AI 에이전트"), ("examples", "예제로 시작"), ("explorer", "전체 API"),
+                          ("glossary", "용어 사전"), ("settings", "인증키·설정")):
             button = QPushButton(text, objectName="navButton", checkable=True)
             button.setCursor(Qt.PointingHandCursor)
             button.clicked.connect(lambda _=False, k=key: self.go(k))
@@ -1116,10 +1753,16 @@ class MainWindow(QMainWindow):
         self.nav_buttons[target].setChecked(True)
         if key == "settings":
             self.settings.refresh_state()
+        elif key == "agent":
+            self.agent_page.refresh_login()
 
     def open_example(self, example: Example):
         self.runner.load(example)
         self.go("runner")
+
+    def ask_agent(self, prompt: str):
+        self.go("agent")
+        self.agent_page.submit(prompt)
 
     def status(self, text: str, timeout: int = 6000):
         self.statusBar().showMessage(text, timeout)
@@ -1270,6 +1913,8 @@ class MainWindow(QMainWindow):
         self.save_report(build_guide_report())
 
     def closeEvent(self, event):
+        self.agent_page.shutdown()
+        self.scan_page.shutdown()
         self.pool.clear()
         self.pool.waitForDone(3000)
         super().closeEvent(event)
