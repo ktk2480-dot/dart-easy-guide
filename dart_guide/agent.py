@@ -113,6 +113,13 @@ def clean_env() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if k.upper() not in _AUTH_OVERRIDES and k != "CLAUDECODE"}
 
 
+def _strip_auth_env() -> None:
+    """Agent SDK는 부모 환경을 Claude Code에 물려주므로, 로그인이 아닌 인증 경로를 이 프로세스에서 지운다."""
+    for name in list(os.environ):
+        if name.upper() in _AUTH_OVERRIDES:
+            del os.environ[name]
+
+
 def _workspace() -> str:
     """사용자 프로젝트의 설정이나 파일이 섞이지 않도록 빈 폴더에서 실행한다."""
     folder = Path(tempfile.gettempdir()) / "DartGuideAgent"
@@ -537,9 +544,7 @@ class ClaudeAgent:
         status = await asyncio.to_thread(check_auth, self._keys)
         if not status.ready:
             raise AgentError(status.message)
-        for name in list(os.environ):
-            if name.upper() in _AUTH_OVERRIDES:
-                del os.environ[name]  # SDK가 부모 환경을 물려주므로 이 프로세스에서 지운다.
+        _strip_auth_env()
         if status.mode == "api":
             try:
                 key = self._keys.load() if self._keys else None

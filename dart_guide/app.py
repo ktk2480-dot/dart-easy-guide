@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import threading
 from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
@@ -21,7 +22,7 @@ from PySide6.QtWidgets import (
 
 from . import APP_NAME, __version__
 from .agent import API_KEY_URL, AgentError, ClaudeAgent, ClaudeStatus, DartTools, check_auth, open_login, test_api_key
-from .analysis import analyze_company, build_report, contract_tables, display_table
+from .analysis import CompanyAnalysis, analyze_company, build_report, contract_tables, display_table
 from .derivative_contracts import Contract
 from .derivative_scan import KST, PRESETS, SCOPES, ScanRunner, ScanStore
 from .filing import FilingTable
@@ -29,7 +30,7 @@ from .catalog import (
     BINARY_ENDPOINTS, KEY_APPLY_URL, MULTI_COMPANY_ENDPOINTS, PARAM_CHOICES, REPORT_CHOICES, guide_link, load_catalog,
 )
 from .client import DartClient, DartError, KEY_ERROR_CODES, describe_call
-from .corp_index import Company, CorpIndex
+from .corp_index import Company, CorpIndex, ProfileCache
 from .examples import (
     CATEGORIES, EXAMPLES, Example, RunInput, default_year, explorer_fetch, explorer_report, latest_for_endpoint,
     run_example, viewer_url,
@@ -37,6 +38,10 @@ from .examples import (
 from .formatting import months_ago
 from .guide import KEY_STEPS, build_guide_report, glossary_html
 from .keystore import ClaudeKeyStore, KeyStore, KeyStoreError, is_valid_claude_key, is_valid_key, mask_key
+from .news import NEWS_MONTHS, fetch_news, news_message_section, news_period, news_section
+
+NEWS_PENDING = ("AI가 월별·주제별 검색과 신용·자금 집중 검색으로 뉴스를 찾고 같은 기간 공시와 대조하고 있습니다. "
+                "보통 2~4분 걸리며, 끝나면 이 항목이 채워집니다.")
 from .report import Report, Section, Table, apply_to_document, export_pdf
 
 POPULAR = [("삼성전자", "005930"), ("SK하이닉스", "000660"), ("현대차", "005380"), ("NAVER", "035420"), ("카카오", "035720")]
@@ -277,10 +282,11 @@ class ReportView(QTextBrowser):
         super().resizeEvent(event)
         self._resize_timer.start()
 
-    def show_report(self, report: Report):
+    def show_report(self, report: Report, keep_position: bool = False):
+        position = self.verticalScrollBar().value()
         self.report = report
         self._render()
-        self.verticalScrollBar().setValue(0)
+        self.verticalScrollBar().setValue(position if keep_position else 0)
 
     def show_message(self, title: str, body: str):
         self.report = None
@@ -288,6 +294,84 @@ class ReportView(QTextBrowser):
             f'<div style="margin-top:70px;" align="center"><p style="font-size:14pt;font-weight:700;color:#173b6c;">{title}</p>'
             f'<p style="color:#5b6470;">{body}</p></div>'
         )
+
+
+def tidy_ceo(value: str) -> str:
+    """'이 종 욱'처럼 한 글자씩 띄어 쓴 이름은 붙이고, 여러 명이면 쉼표로 잇는다."""
+    names = []
+    for part in re.split(r"\s*[,/·ㆍ]\s*|\s{2,}", value.strip()):
+        tokens = part.split()
+        if tokens and all(re.fullmatch(r"[가-힣]", t) for t in tokens):
+            part = "".join(tokens)
+        if part:
+            names.append(" ".join(part.split()))
+    return ", ".join(names)
+
+
+class ProfileService(QObject):
+    """회사 고르기 목록에 대표이사를 붙이기 위해 기업개황을 조금씩 받아 저장한다.
+
+    같은 이름의 회사를 구별하는 데 쓰므로, 이름이 겹치는 후보 전부와 목록 위쪽 몇 곳만 조회한다.
+    새로 검색하면 이전 조회는 멈춘다. 인증키가 없거나 조회가 막히면 대표이사 없이 목록만 보여 준다.
+    """
+    ready = Signal(str)
+    TOP = 10
+    MAX_CALLS = 20
+
+    def __init__(self, main: "MainWindow", cache: ProfileCache):
+        super().__init__(main)
+        self.main, self.cache = main, cache
+        self._known: dict[str, tuple[str, str]] = {}
+        self._checked: set[str] = set()  # 저장 파일에서 이미 찾아본 회사. 없던 회사를 매번 다시 찾지 않는다.
+        self._generation = 0
+
+    def lookup(self, codes: list[str]) -> dict[str, tuple[str, str]]:
+        missing = [c for c in codes if c not in self._known and c not in self._checked]
+        if missing:
+            self._known.update(self.cache.get_many(missing))
+            self._checked.update(missing)
+        return {c: self._known[c] for c in codes if c in self._known}
+
+    def ceo(self, corp_code: str) -> str:
+        return self.lookup([corp_code]).get(corp_code, ("", ""))[0]
+
+    def describe(self, company: Company) -> str:
+        ceo = self.ceo(company.corp_code)
+        return f"{company.label}  ·  대표 {ceo}" if ceo else company.label
+
+    def tooltip(self, company: Company) -> str:
+        ceo, address = self.lookup([company.corp_code]).get(company.corp_code, ("", ""))
+        lines = [f"고유번호 {company.corp_code}"] + ([f"대표 {ceo}"] if ceo else []) + ([f"주소 {address}"] if address else [])
+        return "\n".join(lines)
+
+    def request(self, companies: list[Company]) -> None:
+        self._generation += 1
+        names = [c.corp_name for c in companies]
+        wanted = [c.corp_code for i, c in enumerate(companies) if i < self.TOP or names.count(c.corp_name) > 1]
+        known = self.lookup(wanted)
+        missing = [c for c in dict.fromkeys(wanted) if c not in known][:self.MAX_CALLS]
+        key = self.main.require_key(prompt=False)
+        if not missing or not key:
+            return
+        generation, client = self._generation, self.main.make_client(key)
+
+        def work():
+            for code in missing:
+                if generation != self._generation:
+                    return
+                try:
+                    info = client.get_json("company", corp_code=code)
+                except DartError:
+                    return  # 한도 초과, 키 오류, 네트워크 문제면 더 부르지 않는다.
+                except Exception:
+                    return
+                ceo = tidy_ceo(str(info.get("ceo_nm") or ""))[:30]
+                address = re.sub(r"\s+", " ", str(info.get("adres") or "")).strip()[:80]
+                self.cache.put(code, ceo, address)
+                self._known[code] = (ceo, address)
+                self.ready.emit(code)
+
+        threading.Thread(target=work, daemon=True, name="corp-profile").start()
 
 
 class CompanyPicker(QWidget):
@@ -319,8 +403,13 @@ class CompanyPicker(QWidget):
         self.chip_layout.setContentsMargins(0, 0, 0, 0)
         self.chip_layout.setSpacing(4)
         layout.addWidget(self.chip_grid)
+        # 후보 목록이 열려 있는 동안에는 숨겨서, 같은 이름 회사를 대표이사로 비교할 자리를 넓힌다.
+        self.quick_box = QWidget()
+        quick_layout = QVBoxLayout(self.quick_box)
+        quick_layout.setContentsMargins(0, 0, 0, 0)
+        quick_layout.setSpacing(6)
         if not compact:
-            layout.addWidget(label("자주 찾는 회사", "muted"))
+            quick_layout.addWidget(label("자주 찾는 회사", "muted"))
             quick = QGridLayout()
             quick.setSpacing(4)
             for index, (name, code) in enumerate(POPULAR):
@@ -328,27 +417,49 @@ class CompanyPicker(QWidget):
                 button.setObjectName("quick")
                 button.clicked.connect(lambda _=False, c=code: self._pick_stock(c))
                 quick.addWidget(button, index // 3, index % 3)
-            layout.addLayout(quick)
+            quick_layout.addLayout(quick)
+            layout.addWidget(self.quick_box)
+        self.results.setMinimumHeight(132)
         self.timer = QTimer(self, singleShot=True, interval=180)
         self.timer.timeout.connect(self._search)
+        main.profiles.ready.connect(self._profile_ready)
+
+    def _show_results(self, visible: bool):
+        self.results.setVisible(visible)
+        self.quick_box.setVisible(not visible)
 
     def _on_edit(self, text: str):
         if not text.strip():
-            self.results.hide()
+            self._show_results(False)
             return
         self.main.with_index(self.timer.start)
 
     def _search(self):
         rows = self.main.index.search(self.edit.text(), limit=25, listed_only=self.listed_only)
         self.results.clear()
+        self.main.profiles.lookup([c.corp_code for c in rows])  # 저장된 대표이사를 한 번에 읽는다.
         for company in rows:
-            item = QListWidgetItem(company.label)
+            item = QListWidgetItem(self.main.profiles.describe(company))
             item.setData(Qt.UserRole, company)
+            item.setToolTip(self.main.profiles.tooltip(company))
             self.results.addItem(item)
         if not rows:
             self.results.addItem("검색 결과가 없습니다")
             self.results.item(0).setFlags(Qt.NoItemFlags)
-        self.results.setVisible(True)
+        self._show_results(True)
+        self.main.profiles.request(rows)
+
+    @Slot(str)
+    def _profile_ready(self, corp_code: str):
+        """대표이사가 도착하면 목록과 선택한 회사 표시를 고친다."""
+        for index in range(self.results.count()):
+            item = self.results.item(index)
+            company = item.data(Qt.UserRole)
+            if company and company.corp_code == corp_code:
+                item.setText(self.main.profiles.describe(company))
+                item.setToolTip(self.main.profiles.tooltip(company))
+        if any(c.corp_code == corp_code for c in self.selected):
+            self._render()
 
     def _pick_first(self):
         if self.timer.isActive():
@@ -381,7 +492,7 @@ class CompanyPicker(QWidget):
             self.selected = [company]
             self.main.last_company = company
         self.edit.clear()
-        self.results.hide()
+        self._show_results(False)
         self._render()
         self.changed.emit()
 
@@ -396,9 +507,9 @@ class CompanyPicker(QWidget):
             if child:
                 child.deleteLater()
         for company in self.selected:
-            chip = QPushButton(f"{company.label}   ×")
+            chip = QPushButton(f"{self.main.profiles.describe(company)}   ×")
             chip.setObjectName("chip")
-            chip.setToolTip("누르면 선택을 해제합니다")
+            chip.setToolTip(self.main.profiles.tooltip(company) + "\n누르면 선택을 해제합니다")
             chip.clicked.connect(lambda _=False, c=company: self.remove(c))
             self.chip_layout.addWidget(chip)
 
@@ -991,14 +1102,17 @@ class ExplorerPage(QWidget):
 
 
 class AnalysisPage(QWidget):
-    """업체명을 고르면 업체정보, 3개년 재무, 수출입, 파생거래를 한 번에 보여 준다."""
+    """업체명을 고르면 업체정보, 3개년 재무, 수출입, 파생거래와 최근 뉴스(AI 웹 검색)를 한 번에 보여 준다."""
+    news_done = Signal(int, object)
 
     def __init__(self, main: "MainWindow"):
         super().__init__()
         self.setObjectName("page")
         self.main = main
         self.company: Company | None = None
+        self.analysis: CompanyAnalysis | None = None
         self._run_id = 0
+        self.news_done.connect(self._news_finished, Qt.QueuedConnection)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(24, 20, 24, 14)
         outer.setSpacing(10)
@@ -1022,7 +1136,12 @@ class AnalysisPage(QWidget):
         body = QHBoxLayout()
         body.setSpacing(14)
         side = QFrame(objectName="panel")
-        side.setFixedWidth(330)
+        # 창이 낮아도 후보 목록과 뉴스 설정이 겹치지 않도록 왼쪽 패널을 스크롤 안에 둔다.
+        side_scroll = QScrollArea()
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setFixedWidth(330)
+        side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        side_scroll.setWidget(side)
         form = QVBoxLayout(side)
         form.setContentsMargins(15, 15, 15, 15)
         form.setSpacing(7)
@@ -1035,22 +1154,50 @@ class AnalysisPage(QWidget):
         self.run_button.clicked.connect(self.run)
         form.addWidget(self.run_button)
         form.addSpacing(8)
+        form.addWidget(label("뉴스", "h2"))
+        self.news_box = QCheckBox(f"최근 {NEWS_MONTHS}개월 뉴스 포함 (AI 웹 검색)")
+        self.news_box.setChecked(True)
+        self.news_box.setToolTip("AI 에이전트와 같은 연결(Claude Code 로그인, 없으면 Claude API 키)로 웹을 검색합니다. "
+                                 "로그인은 구독 사용량을, API 키는 검색·토큰 요금을 씁니다.")
+        form.addWidget(self.news_box)
+        news_row = QHBoxLayout()
+        news_row.addWidget(label("기준일"))
+        self.news_date = QDateEdit(calendarPopup=True)
+        self.news_date.setDisplayFormat("yyyy-MM-dd")
+        today = date.today()
+        self.news_date.setDate(QDate(today.year, today.month, today.day))
+        self.news_date.setMaximumDate(QDate(today.year, today.month, today.day))
+        self.news_date.dateChanged.connect(self._news_period_changed)
+        self.news_box.toggled.connect(self._news_period_changed)
+        news_row.addWidget(self.news_date, 1)
+        form.addLayout(news_row)
+        self.news_hint = label("", "muted", True)
+        form.addWidget(self.news_hint)
+        self.news_button = QPushButton("뉴스만 다시 검색")
+        self.news_button.setEnabled(False)
+        self.news_button.clicked.connect(self._search_news_again)
+        form.addWidget(self.news_button)
+        form.addSpacing(8)
         form.addWidget(label("분석 항목", "h2"))
-        for text in ("1. 업체정보", "2. 3개년 재무정보", "3. 3개년 수출/수입 분석", "4. 3개년 파생거래 내역", "5. 공시 한계와 추가 확인 자료"):
+        for text in ("1. 업체정보", "2. 3개년 재무정보", "3. 3개년 수출/수입 분석", "4. 3개년 파생거래 내역", f"5. 최근 {NEWS_MONTHS}개월 뉴스 (AI)",
+                     "6. 공시 한계와 추가 확인 자료"):
             form.addWidget(label(text))
         form.addStretch(1)
         form.addWidget(label("공시 원문의 표를 읽어 만들며, 합계를 확인할 수 없는 값은 추정하지 않습니다. 거래한도 산정 증빙으로는 별도 자료가 필요합니다.", "muted", True))
-        body.addWidget(side)
+        body.addWidget(side_scroll)
         self.view = ReportView()
         self.view.show_message("업체명을 입력해 주세요", "목록에서 회사를 고르면 바로 분석을 시작합니다.")
         body.addWidget(self.view, 1)
         outer.addLayout(body, 1)
+        self._news_period_changed()
 
     def _picked(self):
         self.company = self.picker.selected[0] if self.picker.selected else None
         self.run_button.setEnabled(bool(self.company))
         self.ai_button.setEnabled(False)
         self.pdf_button.setEnabled(False)
+        self.news_button.setEnabled(False)
+        self.analysis = None
         if self.company:
             self.run()
         else:
@@ -1064,21 +1211,31 @@ class AnalysisPage(QWidget):
             return
         self._run_id += 1
         run_id = self._run_id
+        self.analysis = None
         self.run_button.setEnabled(False)
         self.ai_button.setEnabled(False)
         self.pdf_button.setEnabled(False)
+        self.news_button.setEnabled(False)
         self.view.show_message(f"{company.corp_name} 분석 중입니다", "최근 3개년 공시 원문을 읽고 있습니다. 보통 10초 안팎 걸립니다.")
+        with_news = self.news_box.isChecked()
+        pending = news_message_section(NEWS_PENDING) if with_news else None
 
         def job():
-            return build_report(analyze_company(self.main.make_client(key), company))
+            analysis = analyze_company(self.main.make_client(key), company)
+            return analysis, build_report(analysis, pending)
 
-        def finish(report: Report):
+        def finish(result):
             if run_id != self._run_id:
                 return
+            self.analysis, report = result
             self.run_button.setEnabled(True)
             self.view.show_report(report)
             self.ai_button.setEnabled(True)
             self.pdf_button.setEnabled(True)
+            if with_news:
+                self._start_news(run_id)
+            else:
+                self.news_button.setEnabled(True)
 
         def fail(error: DartError):
             if run_id != self._run_id:
@@ -1087,6 +1244,60 @@ class AnalysisPage(QWidget):
             self.view.show_message("분석하지 못했습니다", error.message)
 
         self.main.run_task(job, finish, fail, f"{company.corp_name} 분석 중")
+
+    # ------------------------------------------------- 최근 뉴스 (AI 웹 검색)
+    def _news_base(self) -> date:
+        return self.news_date.date().toPython()
+
+    def _news_period_changed(self, *_):
+        start, end = news_period(self._news_base())
+        self.news_hint.setText(f"{start:%Y-%m-%d} ~ {end:%Y-%m-%d}의 기사를 월별·주제별로, 그리고 신용·자금 기사를 따로 찾아 같은 기간 공시와 대조합니다. 2~4분 걸리며 AI 사용량이 듭니다."
+                               if self.news_box.isChecked() else "뉴스 없이 공시만 분석합니다.")
+
+    def _search_news_again(self):
+        if self.analysis is None:
+            return
+        self._run_id += 1  # 진행 중이던 이전 검색 결과는 버린다.
+        run_id = self._run_id
+        analysis = self.analysis
+        pending = news_message_section(NEWS_PENDING)
+        self.main.run_task(lambda: build_report(analysis, pending),
+                           lambda report: run_id == self._run_id and self.view.show_report(report, keep_position=True), busy="보고서 정리 중")
+        self._start_news(run_id)
+
+    def _start_news(self, run_id: int):
+        """AI 검색은 몇 분 걸리므로 작업 풀이 아닌 별도 스레드에서 돌리고, 끝나면 신호로 보고서를 다시 만든다."""
+        analysis, base, keys = self.analysis, self._news_base(), self.main.claude_keys
+        dart_key = self.main.require_key(prompt=False)  # 같은 기간 공시와 대조할 때 쓴다. 없으면 대조만 건너뛴다.
+        self.news_button.setEnabled(False)
+        self.main.status("AI가 최근 뉴스를 검색하고 있습니다.", 0)
+
+        def work():
+            try:
+                client = self.main.make_client(dart_key) if dart_key else None
+                profile = {**analysis.info, "corp_code": analysis.company.corp_code}
+                section = news_section(fetch_news(profile, base, keys, client))
+            except AgentError as exc:
+                section = news_message_section(f"뉴스를 검색하지 못했습니다. {exc}")
+            except Exception:
+                section = news_message_section("뉴스를 검색하지 못했습니다. AI 연결과 네트워크 상태를 확인한 뒤 [뉴스만 다시 검색]을 눌러 주세요.")
+            self.news_done.emit(run_id, section)
+
+        threading.Thread(target=work, daemon=True, name="news-search").start()
+
+    @Slot(int, object)
+    def _news_finished(self, run_id: int, section):
+        if run_id != self._run_id or self.analysis is None:
+            return
+        analysis = self.analysis
+
+        def show(report: Report):
+            if run_id == self._run_id:
+                self.view.show_report(report, keep_position=True)
+                self.news_button.setEnabled(True)
+                self.main.status("최근 뉴스를 보고서 5번 항목에 넣었습니다.")
+
+        self.main.run_task(lambda: build_report(analysis, section), show, busy="뉴스를 보고서에 넣는 중")
 
     def _ask_ai(self):
         if self.company:
@@ -1829,6 +2040,7 @@ class MainWindow(QMainWindow):
         self.keys = keys or KeyStore()
         self.claude_keys = claude_keys or ClaudeKeyStore(self.keys.path.with_name(ClaudeKeyStore.filename))
         self.index = index or CorpIndex()
+        self.profiles = ProfileService(self, ProfileCache(self.index.path.with_name("corp_profile.sqlite")))
         self.scan_store = scan_store or ScanStore(self.index.path.with_name("derivative_scan.sqlite"))
         self.session_key: str | None = None
         self.last_company: Company | None = None

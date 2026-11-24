@@ -87,7 +87,7 @@ def _self_check(output: Path) -> int:
     output.write_text(json.dumps(results, ensure_ascii=False, indent=1), encoding="utf-8")
     required = (results["key_encrypts"], results["catalog"] == 85, results["chart_png"], results["svg_plugin"], results["window"],
                 results["tls_status"] == 200, not outside, results["frozen"], results["contract_parse"], results["scan_store"],
-                results["agent_sdk"], results["api_key_path"] is True)
+                results["agent_sdk"], results["api_key_path"] is True, results["news_section"] is True, results["ceo_cache"] is True)
     return 0 if all(required) else 1
 
 
@@ -131,8 +131,60 @@ def _feature_check(folder: Path) -> dict[str, object]:
         results["api_key_path"] = claude_store.load() == sample and sample.encode() not in claude_store.path.read_bytes()
     except Exception as exc:
         results["api_key_path"] = f"{type(exc).__name__}: {exc}"
+    try:
+        # 뉴스: 기사 검증 규칙과 보고서 표 만들기. 검색은 하지 않는다.
+        from datetime import date
+
+        from dart_guide import news
+
+        start, end = news.news_period(date(2026, 11, 24))
+        raw = {"overview": "o", "items": [{"date": "2026-10-01", "title": "점검 기사", "source": "s", "url": "https://a.example/1",
+                                           "summary": "s", "topic": "실적", "importance": "상", "reason": "r", "disclosure": ""}]}
+        items, dropped = news.clean_items(raw, news._urls("https://a.example/1"), start, end, [])
+        section = news.news_section(news.NewsResult("점검", start, end, "점검", "o", items, dropped))
+        results["news_section"] = len(items) == 1 and section.table is not None and len(section.bullets) == 1
+    except Exception as exc:
+        results["news_section"] = f"{type(exc).__name__}: {exc}"
+    try:
+        # 회사 고르기 목록의 대표이사 저장소
+        from dart_guide.app import tidy_ceo
+        from dart_guide.corp_index import ProfileCache
+
+        cache = ProfileCache(folder / "check_profile.sqlite")
+        cache.put("00000001", tidy_ceo("이 종 욱"), "서울")
+        results["ceo_cache"] = cache.get_many(["00000001", "00000002"]) == {"00000001": ("이종욱", "서울")}
+    except Exception as exc:
+        results["ceo_cache"] = f"{type(exc).__name__}: {exc}"
     results["claude_code_found"] = bool(find_cli())
     return results
+
+
+def _news_check(output: Path) -> int:
+    """설치된 Claude Code 로그인으로 실제 뉴스 검색을 한 번 돌린다. 2~4분 걸리고 구독 사용량이 쓰인다."""
+    import time
+    from datetime import date
+
+    from dart_guide.agent import AgentError
+    from dart_guide.client import DartClient
+    from dart_guide.corp_index import CorpIndex
+    from dart_guide.keystore import ClaudeKeyStore, KeyStore
+    from dart_guide.news import fetch_news
+
+    client = DartClient(KeyStore().load())
+    company = CorpIndex().by_stock_code("017960")
+    info = {**client.get_json("company", corp_code=company.corp_code), "corp_code": company.corp_code}
+    started = time.time()
+    try:
+        result = fetch_news(info, date.today(), ClaudeKeyStore(), client)
+        summary = {"seconds": round(time.time() - started), "via": result.via, "items": len(result.items),
+                   "linked": sum(i.disclosure is not None for i in result.items), "dropped": result.dropped,
+                   "disclosures": result.disclosures, "failures": result.failures,
+                   "in_period": all(result.start <= i.date <= result.end for i in result.items),
+                   "titles": [f"{i.date} [{i.importance}] {i.title}" for i in result.items[:5]]}
+    except AgentError as exc:
+        summary = {"error": str(exc)}
+    output.write_text(json.dumps(summary, ensure_ascii=False, indent=1), encoding="utf-8")
+    return 0 if summary.get("items") and summary.get("in_period") and not summary.get("failures") else 1
 
 
 def _agent_check(output: Path) -> int:
@@ -179,6 +231,8 @@ def main() -> int:
             return _self_check(Path(sys.argv[sys.argv.index("--self-check") + 1]))
         if "--agent-check" in sys.argv:
             return _agent_check(Path(sys.argv[sys.argv.index("--agent-check") + 1]))
+        if "--news-check" in sys.argv:
+            return _news_check(Path(sys.argv[sys.argv.index("--news-check") + 1]))
         from dart_guide.app import main as run_app
 
         return run_app()

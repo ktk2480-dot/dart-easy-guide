@@ -73,6 +73,7 @@ begin
   DeleteFile(Folder + '\claude_api_key.tmp');
   DeleteFile(Folder + '\corp_index.sqlite');
   DeleteFile(Folder + '\corp_index.tmp');
+  DeleteFile(Folder + '\corp_profile.sqlite');
   DeleteFile(Folder + '\derivative_scan.sqlite');
   DeleteFile(Folder + '\derivative_scan.sqlite-wal');
   DeleteFile(Folder + '\derivative_scan.sqlite-shm');

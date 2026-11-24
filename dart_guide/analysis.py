@@ -842,7 +842,7 @@ def _trade_sections(a: CompanyAnalysis) -> list[Section]:
         out.append(Section("3. 3개년 수출/수입 분석", [f"최근 {a.source}에서 내수·수출 구분 금액을 찾지 못했습니다. 회사가 구분해 공시하지 않았을 수 있습니다."]))
 
     if a.source == "감사보고서":
-        out.append(Section("3-2. 수입", ["감사보고서에는 수입 금액 항목이 없어 표시하지 않습니다. '5. 공시 한계와 추가 확인 자료'를 참고해 주세요."]))
+        out.append(Section("3-2. 수입", ["감사보고서에는 수입 금액 항목이 없어 표시하지 않습니다. '공시 한계와 추가 확인 자료' 항목을 참고해 주세요."]))
         for title, table in a.fx_tables:
             out.append(Section(f"외화자산·부채 (간접 자료): {title[:40]}", table=display_table(table)))
         return out
@@ -928,7 +928,7 @@ def _derivative_sections(a: CompanyAnalysis) -> list[Section]:
     return out
 
 
-def _evidence_section(a: CompanyAnalysis) -> Section:
+def _evidence_section(a: CompanyAnalysis, number: int = 5) -> Section:
     """공시로 확인되는 범위와 실제 심사에 필요한 자료를 구분한다."""
     export_basis = {"사업보고서": "사업보고서의 내수/수출 매출 (원화 매출 기준, 통관 기준 아님)",
                     "감사보고서": "감사보고서 주석의 간접 자료"}.get(a.source, "공개 자료로 확인 불가")
@@ -940,22 +940,23 @@ def _evidence_section(a: CompanyAnalysis) -> Section:
         ["파생 잔액", derivative_basis, "기업 제출 거래 내역 및 재무제표 주석 대조"],
         ["타행 파생거래", "공시로 확인 불가 (거래 은행 대부분 미기재)", "고객 확인서, 은행 간 공유 인프라의 운영 여부는 사내 외환·파생 리스크 부서 확인"],
     ]
-    return Section("5. 공시 한계와 추가 확인 자료", ["이 보고서는 공개 공시만 사용합니다. 외환파생상품 거래한도 산정의 증빙으로 쓰려면 아래 자료를 별도로 확인해 주세요."],
+    return Section(f"{number}. 공시 한계와 추가 확인 자료", ["이 보고서의 수치는 공개 공시만 사용합니다. 외환파생상품 거래한도 산정의 증빙으로 쓰려면 아래 자료를 별도로 확인해 주세요."],
                    table=Table(["항목", "이 보고서의 근거", "추가 확인 자료"], rows, widths=[16, 34, 50]))
 
 
-def build_report(a: CompanyAnalysis) -> Report:
+def build_report(a: CompanyAnalysis, news: Section | None = None) -> Report:
+    """news: AI 웹 검색 뉴스 항목(news.py). 있으면 5번에 넣고 공시 한계는 6번이 된다."""
     name = str(a.info.get("corp_name") or a.company.corp_name)
     rows, links = _company_rows(a)
     sections = [Section("1. 업체정보", table=Table(["항목", "내용"], rows, links=links, widths=[28, 72]))]
     summary, metrics = [], [Metric("시장", CORP_CLS.get(a.info.get("corp_cls"), "-")), Metric("대표자", text_or_dash(a.info.get("ceo_nm")))]
     if not a.filings:
         summary.append(f"{name}의 사업보고서와 감사보고서를 DART에서 찾지 못해 업체정보만 표시합니다. 비외감 기업이면 수출입과 파생거래는 공개 경로로 확인할 수 없습니다.")
-        sections.append(_evidence_section(a))
+        sections += ([news] if news else []) + [_evidence_section(a, 6 if news else 5)]
         return Report(f"{name} 업체 분석", "기업개황 기준", summary, metrics, sections, file_stem=_stem(a.company, "업체분석"), calls=a.calls)
 
     sections += _financial_sections(a) + _trade_sections(a) + _derivative_sections(a)
-    sections.append(_evidence_section(a))
+    sections += ([news] if news else []) + [_evidence_section(a, 6 if news else 5)]
     sections.append(Section("근거 보고서", table=_source_rows(a)))
     fin = a.financials
     if fin:
@@ -990,7 +991,8 @@ def build_report(a: CompanyAnalysis) -> Report:
         summary, metrics, sections,
         [f"수출입과 파생거래는 전용 API가 없어 {a.source} 원문의 표를 읽어 정리했습니다. 중요한 숫자는 '근거 보고서'의 원문으로 확인해 주세요.",
          "내수·수출 표는 회사에 따라 별도 기준이거나 일부 사업부문만 포함할 수 있습니다. 표 제목과 주석의 기준을 함께 보세요.",
-         "파생거래 '확인 필요'나 '기재 없음'은 거래가 없다는 확인이 아닙니다. 타행 거래는 공시만으로 알 수 없습니다."],
+         "파생거래 '확인 필요'나 '기재 없음'은 거래가 없다는 확인이 아닙니다. 타행 거래는 공시만으로 알 수 없습니다."]
+        + (["5번 뉴스는 공시가 아니라 AI가 웹에서 찾은 기사입니다. 숫자와 사실은 기사 원문으로 확인해 주세요."] if news else []),
         a.calls, _stem(a.company, "업체분석"),
     )
 
